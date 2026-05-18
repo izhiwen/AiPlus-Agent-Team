@@ -1,87 +1,26 @@
 # Parallel Codex Session Protocol (process doc)
 
-**Drafted**: 2026-05-18 by Advisor
-**Status**: NORMATIVE for all future parallel-codex-session work on `aiplus-public` and `aiplus-agent-team`.
+**Drafted**: 2026-05-18 by Advisor (initial codification)
+**Status**: **SUPERSEDED by CONTRACT v1.1 Appendices D + F (2026-05-18 same day).**
 **Forensic origin**: G-AT-PROD-1 route.rs collision incident — see `goal-G-AT-PROD-1-retrospective.md` "What went wrong" #1.
 
 ---
 
-## When this protocol applies
+## Why this file is now a pointer
 
-Whenever Advisor briefs **two or more** parallel codex sessions to do work on the **same git repository within overlapping time windows**. Even if briefings target nominally-disjoint code paths, shared files (Cargo.toml, CHANGELOG.md, mod.rs, route.rs, lib.rs, etc.) collide more often than expected.
+This document was the original codification of parallel-session safety rules, drafted same-day as the G-AT-PROD-1 route.rs collision incident. CONTRACT v1.1 (authored later the same day) promoted these rules into the authoritative contract surface so adapter implementations and operators have a single source of truth:
 
-## Rule 1 — Each codex session works in its own worktree
+- **Worktree isolation** (former Rules 1-4, 6, anti-patterns) → **CONTRACT.md Appendix D**
+- **Multi-Advisor race / claim-file mechanism** (former Rule 5) → **CONTRACT.md Appendix F**
 
-Briefing MUST specify:
+This file is retained for:
+1. Forensic trail (commit history shows when and why these rules emerged).
+2. Grep discoverability — older briefings link to `parallel-codex-session-protocol.md` by name.
+3. Operational copy of the worktree-isolation briefing template (below).
 
-```text
-- Worktree:  ~/Projects/AiPlus/<repo>.<work-name>/
-- Branch:    feat/<work-name>
-```
+## Briefing template (still in active use)
 
-Example for G-AT-PROD-1:
-- Disk cache: `aiplus-public.disk-cache/` on `feat/v0.2-disk-cache`
-- v0.3 coordinator: `aiplus-public.v03-coord/` on `feat/v0.3.0-p0-coordinator`
-- Codex adapter: `aiplus-agent-team.codex-r3/` on `feat/codex-adapter-round-3`
-
-Codex session begins by creating the worktree:
-
-```bash
-git -C <repo> worktree add ../<repo>.<work-name> -b feat/<work-name>
-cd ../<repo>.<work-name>
-```
-
-All edits, commits, tests happen inside the worktree. Session never touches the main worktree's working tree.
-
-## Rule 2 — Feature branch, never direct to main
-
-Each session pushes to its feature branch only:
-
-```bash
-git push origin feat/<work-name>
-```
-
-Never `git push origin main` from a codex session. Main pushes are Advisor-coordinated.
-
-## Rule 3 — Advisor merges via ff after CEO codex confirms done
-
-When CEO codex reports the work complete + tests PASS:
-
-1. Advisor (or Advisor-supervised sub-agent) verifies feature branch:
-   ```bash
-   git fetch origin
-   git diff main..origin/feat/<work-name> --stat
-   cargo test --workspace  # on the feature branch
-   ```
-2. If clean: ff merge to main + push:
-   ```bash
-   git checkout main
-   git merge --ff-only origin/feat/<work-name>
-   git push origin main
-   ```
-3. Feature branch is preserved (NOT deleted) for forensic trail. Tiny disk cost; large incident-recovery value.
-
-## Rule 4 — Shared files (route.rs, Cargo.toml, etc.) need explicit owner
-
-If parallel sessions BOTH need to modify the same shared file, briefing MUST designate one as **owner** of the shared file in this round:
-
-- Owner session: makes edits, commits, pushes feature branch first.
-- Non-owner session(s): wait for owner's branch to merge into main, then rebase their feature branch on the new main, integrate, commit, push.
-
-If briefing fails to designate an owner → second session to touch the shared file STOPs and pings Advisor for coordination. NEVER silently merge ad-hoc.
-
-## Rule 5 — Multi-Advisor coordination
-
-Multiple Advisor sessions on the same goal can also race (this happened in G-AT-PROD-1 during the combined commit). Guidelines:
-
-- One Advisor session is **primary** for a given goal. Others defer.
-- If primary is uncertain, the first Advisor session to commit-stash-claim the working state by writing `.aiplus/agent-team/_advisor-claim.txt` becomes primary; others read this file before acting.
-- If claim file exists and is younger than 10 minutes, secondary Advisor waits or pings primary.
-- After primary completes coordination, primary removes claim file.
-
-## Rule 6 — Briefing template addition
-
-Every future codex briefing MUST include this section verbatim near the top, with `<work-name>` filled in:
+Every codex-session briefing MUST include this block verbatim near the top, with `<work-name>` filled in:
 
 ```text
 ## Worktree isolation (NON-OPTIONAL)
@@ -98,26 +37,27 @@ Shared-file ownership for this round:
 - If you need to touch a not-owned shared file, STOP and ping Advisor.
 ```
 
-## Anti-patterns (FORBIDDEN)
+This template is the operational form of CONTRACT App D Rules D.1 + D.3.
 
-- ❌ Parallel codex sessions sharing `~/Projects/AiPlus/<repo>/` working tree
-- ❌ Codex session pushing directly to main
-- ❌ Silent ad-hoc merge of conflicting working-tree changes
-- ❌ Advisor doing combined commits without first checking if another Advisor instance is active
-- ❌ Deleting feature branches before merging to main and verifying
+## Forensic record (preserved)
 
-## Validation
+The original 6 rules were drafted 2026-05-18 post G-AT-PROD-1 route.rs collision.
 
-This protocol is validated by:
-- G-AT-PROD-1 incident showing what happens WITHOUT it (route.rs collision, combined commit, cross-Advisor race)
-- D5 evidence patch in G-AT-PROD-1 successfully using the protocol (`feat/v0.3-d5-evidence` branch, clean ff merge)
+**Negative example**: pre-protocol parallel sessions on `aiplus-public` produced an uncommitted-working-tree collision on `route.rs`. Two sessions (disk cache + v0.3 coordinator) both modified the same file. Resolution required a combined commit `56ea0e5` by Advisor coordination — ~20 minutes recovery cost.
 
-## Future revisions
+**Positive example**: post-protocol `feat/v0.3-d5-evidence`, `feat/v0.3.0-polish`, and `feat/contract-v1.1` (the branch that authored this very downgrade) all merged via ff cleanly with zero collision.
 
-- v1.0 (this) — initial protocol from G-AT-PROD-1 retrospective.
-- v1.x (anticipated) — add specifics for cross-repo parallel work (e.g., aiplus-public + aiplus-agent-team simultaneously).
-- v2 (potential) — if claim-file mechanism (Rule 5) proves insufficient, upgrade to file-locking or coordinator agent.
+Cross-Advisor race (the other half of G-AT-PROD-1 incident): two Advisor instances authored byte-identical `56ea0e5` commits. Now prevented by App F claim-file mechanism.
+
+## Original rule history (archived; reference CONTRACT App D + F for authoritative form)
+
+- Rule 1 (per-session worktree) → App D Rule D.1
+- Rule 2 (feature branch, never direct to main) → App D Rule D.2
+- Rule 3 (Advisor ff-merge after CEO done) → operational practice; documented per-goal in goal docs
+- Rule 4 (shared-file owner designation) → App D Rule D.3
+- Rule 5 (multi-Advisor claim file) → App F Rules F.1-F.4
+- Rule 6 (briefing template) → see "Briefing template" section above; same content
 
 ---
 
-— Advisor, 2026-05-18, post G-AT-PROD-1 close
+— Advisor, 2026-05-18 (drafted + same-day superseded)
