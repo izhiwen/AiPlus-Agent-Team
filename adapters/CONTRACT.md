@@ -1,6 +1,6 @@
 # AiPlus Agent Team — Adapter Contract v0
 
-**Status**: v0.1 DRAFT (Owner review pass complete: A1+A2 signal-timing fix, B1-B6 tightens, C1 Codex flag confirmed). Awaits validation through reference Claude Code adapter implementation.
+**Status**: v1 DRAFT (informed by Claude Code reference adapter spiral round 1, commit `d04797e` + 2 captured painpoints). Awaits validation by 2nd adapter (OpenCode, round 2) before frozen.
 **Frozen on**: 2nd adapter pass-through of conformance suite, not earlier.
 **Pilot adapter**: Claude Code (`adapters/claude-code/`).
 **Non-goals**: transport choice, per-arg tool granularity, cross-runtime parallelism, output streaming — out of v0 scope.
@@ -94,6 +94,10 @@ CEO generates `session_id` (UUIDv7) at dispatch. Adapter maintains mapping at `.
 - **Aging**: entries with `last_used_at > 24h` MAY be purged (per-adapter policy, documented in IMPLEMENTATION.md §6). Entries with `last_used_at > 30 days` MUST be purged. Mapping file SHOULD stay ≤ 10 MB; when exceeded, adapter purges oldest-first until under threshold.
 - **Corruption**: JSON parse fail → adapter drops the file, CEO cold-starts with new session. NEVER silently continue with broken mapping. Surfaced via `aiplus agent doctor`.
 
+### 4.3 Runtime-session-ID discovery fallback
+
+If adapter cannot discover the runtime's internal session ID after spawn (runtime doesn't emit one, or emits in unparseable form), adapter MAY use the CEO `session_id` (UUIDv7) as the `runtime_session_id` in the mapping. This allows continuity to work even when the runtime is opaque about session identity. Per-adapter behavior documented in IMPLEMENTATION.md §6.
+
 ## 5. Working directory
 
 - `worktree_path` MUST be absolute.
@@ -109,9 +113,27 @@ CEO generates `session_id` (UUIDv7) at dispatch. Adapter maintains mapping at `.
 
 Adapter MUST NOT inherit Owner's global config directory (`~/.claude/`, `~/.codex/`, `~/.config/opencode/`, etc.). Isolation mechanism is per-runtime; see Appendix A.
 
-Failure to isolate → adapter MUST fail-fast at startup with `exit_status=ISOLATION_BREACH`. Silent fallback to Owner config is forbidden.
+### 6.1 Auth-channel taxonomy
 
-Conformance #03 validates via positive sentinel test: harness seeds isolated config with `sentinel: "isolation-test-<timestamp>"`, adapter spawns runtime instructed to dump loaded config, assertion checks sentinel present AND Owner's known global markers absent.
+| Channel | Allowed? | Notes |
+|---|---|---|
+| Config-dir inheritance | **FORBIDDEN** | includes `~/.claude/`, `~/.codex/`, `~/.config/opencode/`, keychain reads via global config |
+| Env-var credentials | **ALLOWED** | e.g., `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`. Adapter subprocess env restricted to `PATH` + named credential var(s); all other env stripped |
+| `apiKeyHelper` via `--settings` (Claude Code) or per-runtime equivalent | **ALLOWED** | settings file must itself be isolated, NOT Owner-global |
+
+Each adapter's `IMPLEMENTATION.md` §2 MUST document: (a) which channels it uses, (b) how CEO provides credentials. **Recommended provisioning pattern**: `aiplus secret-broker run --aliases <alias> -- <adapter cmd>` — backend-agnostic (works for keyring AND BWS). NOTE: `aiplus secret-broker need <alias>` is keyring-only and will FAIL on BWS or other non-keyring backends — do NOT recommend it as the default pattern.
+
+### 6.2 Validation requirement
+
+Adapter MUST validate its isolation artifacts (settings file, MCP config, plugin dir) BEFORE spawn — runtimes like Claude Code's `--print` may silently ignore invalid settings, hiding isolation breaches behind a successful spawn. Validation includes JSON parse + adapter-marker presence + writability check. Validation failure → `exit_status=ISOLATION_BREACH`, no spawn attempted.
+
+### 6.3 Sentinel attestation
+
+Conformance #03 validates isolation via positive sentinel test: harness seeds isolated config with `sentinel: "isolation-test-<timestamp>"`, adapter spawns runtime instructed to dump loaded config, assertion checks sentinel present AND Owner's known global markers absent.
+
+### 6.4 Failure mode
+
+Failure to isolate → adapter MUST fail-fast at startup with `exit_status=ISOLATION_BREACH`. Silent fallback to Owner config is forbidden.
 
 ## 7. Owner-interrupt protocol
 
@@ -200,7 +222,7 @@ Each runtime's IMPLEMENTATION.md MUST document:
 ## Revisions
 
 - v0 — initial draft. Spiral round 0.
-- v0.1 (this) — pre-implementation tighten pass: A1+A2 signal-timing aligned with conformance #04; B1-B6 (final_text semantics, tool_calls field requirements, mapping aging hard limits, --output-file flag clarity, §11 schema-version migration, redaction wording); C1 Codex `-C, --cd` confirmed in Appendix A. Still round 0.
-- v1 (planned) — after Claude Code reference adapter discovers contract gaps.
-- v2 (planned) — after 2nd adapter (Codex or OpenCode) validates contract is not Claude-shaped.
+- v0.1 — pre-implementation tighten pass: A1+A2 signal-timing aligned with conformance #04; B1-B6 (final_text semantics, tool_calls field requirements, mapping aging hard limits, --output-file flag clarity, §11 schema-version migration, redaction wording); C1 Codex `-C, --cd` confirmed in Appendix A. Still round 0.
+- v1 (this) — after Claude Code reference adapter spiral round 1 (commit `d04797e` + painpoints): added §4.3 runtime-session-ID discovery fallback; restructured §6 into 6.1 auth-channel taxonomy (FORBIDDEN config-dir / ALLOWED env-var / ALLOWED apiKeyHelper) + 6.2 isolation-validation requirement (catches runtimes that silently ignore invalid settings) + 6.3 sentinel attestation (unchanged from v0.1) + 6.4 failure mode (unchanged from v0.1). Recommended provisioning pattern is now backend-agnostic `secret-broker run` (NOT keyring-only `need`). Conformance specs `01-07.spec.md` unchanged — semantics didn't shift.
+- v2 (planned) — after 2nd adapter (OpenCode, round 2) validates contract is not Claude-shaped.
 - **Frozen** = v2 passes full conformance suite on both adapters.
