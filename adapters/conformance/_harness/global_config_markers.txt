@@ -1,0 +1,5 @@
+~/.claude/CLAUDE.md
+~/.claude/settings.json
+~/.codex/config.toml
+~/.config/opencode/config.json
+~/.aiplus/
