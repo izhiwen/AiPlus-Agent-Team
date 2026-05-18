@@ -15,3 +15,7 @@
 **Why blocked**: Live OpenCode resumed/spawned correctly, proving #07a/#07b runtime mapping behavior, but for adapter-local maintenance prompts it repeatedly used tools (`glob`, `grep`, `read`, `bash`) and stalled without final assistant text before TTL. This does not indicate CONTRACT v1 cannot express session mapping; it is the same OpenCode non-interactive tool-loop instability observed in #03.
 
 **Workaround applied (OPENCODE-BUG)**: Use live OpenCode for #07a and #07b to prove real session creation/resume, then use a deterministic fake OpenCode runtime for #07c/#07d/#07e to verify adapter-local mapping behavior: corrupt JSON rename/recreate, documented 24-hour purge/cold-start, and schema-version drift treated as corruption.
+
+## Round 3 (Codex): Painpoints (none)
+
+Codex adapter conformance #01→#02→#03→#06→#04→#05→#07 completed on 2026-05-18 with zero `_CONTRACT-BUG_` and zero `_CODEX-BUG_` painpoints.
