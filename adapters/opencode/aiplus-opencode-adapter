@@ -1,0 +1,636 @@
+#!/usr/bin/python3
+import argparse
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+ADAPTER = "opencode"
+SCHEMA_VERSION = "1.0"
+EX_TEMPFAIL = 75
+child = None
+child_pgid = None
+interrupt_at = None
+term_sent = False
+
+PROVIDER_ENV_ALLOWLIST = {
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GEMINI_API_KEY",
+    "GROQ_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+}
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def result(session_id, stdout_raw, final_text, exit_status, partial, tool_calls=None, usage_tokens=None):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id,
+        "stdout_raw": stdout_raw,
+        "tool_calls": tool_calls,
+        "final_text": final_text,
+        "usage_tokens": usage_tokens,
+        "exit_status": exit_status,
+        "partial": partial,
+    }
+
+
+def truncate(text, limit=200):
+    text = str(text)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def redact(value):
+    if isinstance(value, dict):
+        return {k: redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    if isinstance(value, str):
+        value = re.sub(r"sk-[A-Za-z0-9_-]{12,}", "[REDACTED]", value)
+        value = re.sub(r"(?i)(api[_-]?key|token|secret)(['\"=:\\s]+)[^\\s'\"}]+", r"\1\2[REDACTED]", value)
+    return value
+
+
+def load_request(args):
+    if args.request_file:
+        return json.loads(Path(args.request_file).read_text())
+    data = sys.stdin.read()
+    if not data.strip():
+        raise ValueError("empty AdapterRequest stdin")
+    return json.loads(data)
+
+
+def validate_request(req):
+    required = {
+        "schema_version": str,
+        "session_id": str,
+        "role": str,
+        "task": str,
+        "worktree_path": str,
+        "memory": dict,
+        "system_prompt": str,
+        "allowed_tools": list,
+        "ttl_seconds": int,
+        "continuation_hint": str,
+        "override_dirty_worktree": bool,
+    }
+    for key, typ in required.items():
+        if key not in req or not isinstance(req[key], typ):
+            raise ValueError(f"AdapterRequest invalid field: {key}")
+    if req["schema_version"].split(".")[0] != "1":
+        raise ValueError(f"unsupported schema_version={req['schema_version']}")
+
+
+def emit_adapter_result(adapter_result, output_file=None):
+    encoded = json.dumps(adapter_result, ensure_ascii=False, separators=(",", ":"))
+    if output_file:
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_file).write_text(encoded + "\n")
+    else:
+        print(encoded, flush=True)
+
+
+def project_agent_dir(worktree_path):
+    return Path(worktree_path) / ".aiplus" / "agent-team"
+
+
+def trace_path(worktree_path, session_id):
+    return project_agent_dir(worktree_path) / "adapter-trace" / f"{session_id}.jsonl"
+
+
+def trace_enabled(worktree_path):
+    return not (project_agent_dir(worktree_path) / "trace-disabled").exists()
+
+
+def rotate_trace_if_needed(path):
+    if not path.exists():
+        return
+    try:
+        if path.stat().st_size > 100 * 1024 * 1024:
+            path.rename(path.with_suffix(path.suffix + f".rotated-{int(time.time())}"))
+            return
+        first_line = path.read_text(errors="ignore").splitlines()[0:1]
+        if first_line:
+            entry = json.loads(first_line[0])
+            ts = entry.get("timestamp")
+            if ts:
+                then = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - then).days >= 7:
+                    path.rename(path.with_suffix(path.suffix + f".rotated-{int(time.time())}"))
+    except Exception:
+        return
+
+
+def append_trace(worktree_path, session_id, kind, payload):
+    if not worktree_path or not session_id or not trace_enabled(worktree_path):
+        return
+    try:
+        path = trace_path(worktree_path, session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rotate_trace_if_needed(path)
+        entry = {"schema_version": SCHEMA_VERSION, "timestamp": utc_now(), "adapter": ADAPTER, "kind": kind, "payload": redact(payload)}
+        with path.open("a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        return
+
+
+def git_bin():
+    return shutil.which("git") or ("/usr/bin/git" if Path("/usr/bin/git").exists() else "git")
+
+
+def verify_worktree(req):
+    path = Path(req["worktree_path"])
+    if not path.is_absolute() or not path.is_dir():
+        return False, "worktree_path is not an existing absolute directory"
+    real = str(path.resolve())
+    try:
+        listed = subprocess.run([git_bin(), "-C", real, "worktree", "list", "--porcelain"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        if listed.returncode != 0:
+            return False, "git worktree list failed"
+        paths = [line.removeprefix("worktree ").strip() for line in listed.stdout.splitlines() if line.startswith("worktree ")]
+        if real not in [str(Path(p).resolve()) for p in paths]:
+            return False, "path is not listed as a git worktree"
+        status = subprocess.run([git_bin(), "-C", real, "status", "--porcelain"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        if status.returncode != 0:
+            return False, "git status failed"
+        dirty_lines = [line for line in status.stdout.splitlines() if not line.startswith("?? ")]
+        if dirty_lines and not req.get("override_dirty_worktree"):
+            return False, "worktree has tracked modifications"
+    except Exception as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def isolation_paths(worktree_path):
+    env_dir = os.environ.get("AIPLUS_OPENCODE_ISOLATED_CONFIG_DIR")
+    base = Path(env_dir) if env_dir else project_agent_dir(worktree_path) / "opencode-isolation"
+    return {
+        "base": base,
+        "config_home": base / "xdg-config-home",
+        "marker": base / "adapter-marker.json",
+        "sentinel": base / "sentinel.txt",
+    }
+
+
+def prepare_isolation(worktree_path):
+    if os.environ.get("AIPLUS_OPENCODE_ADAPTER_BREAK_ISOLATION") == "1":
+        raise RuntimeError("forced isolation breach for conformance")
+    paths = isolation_paths(worktree_path)
+    paths["base"].mkdir(parents=True, exist_ok=True)
+    paths["config_home"].mkdir(parents=True, exist_ok=True)
+    sentinel = os.environ.get("AIPLUS_OPENCODE_ISOLATION_SENTINEL")
+    if not sentinel:
+        if paths["sentinel"].exists():
+            sentinel = paths["sentinel"].read_text(errors="ignore").splitlines()[0].strip()
+        else:
+            sentinel = f'sentinel: "isolation-test-{int(time.time())}"'
+    paths["sentinel"].write_text(sentinel + "\n")
+    marker = {"schema_version": SCHEMA_VERSION, "adapter": ADAPTER, "sentinel": sentinel}
+    paths["marker"].write_text(json.dumps(marker, indent=2) + "\n")
+    parsed = json.loads(paths["marker"].read_text())
+    if parsed.get("adapter") != ADAPTER or parsed.get("sentinel") != sentinel:
+        raise RuntimeError("isolation marker validation failed")
+    probe = paths["config_home"] / ".write-probe"
+    probe.write_text("ok\n")
+    probe.unlink()
+    return paths, sentinel
+
+
+def load_mapping(worktree_path):
+    sessions_dir = project_agent_dir(worktree_path) / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    path = sessions_dir / f"{ADAPTER}.json"
+    if not path.exists():
+        return path, {"schema_version": SCHEMA_VERSION, "entries": {}}, False
+    try:
+        mapping = json.loads(path.read_text())
+        if mapping.get("schema_version") != SCHEMA_VERSION or not isinstance(mapping.get("entries"), dict):
+            raise ValueError("mapping schema mismatch")
+        purge_mapping(mapping)
+        return path, mapping, False
+    except Exception:
+        corrupt = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        try:
+            path.rename(corrupt)
+        except Exception:
+            try:
+                path.unlink()
+            except Exception:
+                pass
+        return path, {"schema_version": SCHEMA_VERSION, "entries": {}}, True
+
+
+def purge_mapping(mapping):
+    now = time.time()
+    keep = {}
+    for key, entry in mapping.get("entries", {}).items():
+        try:
+            last = datetime.fromisoformat(entry["last_used_at"].replace("Z", "+00:00")).timestamp()
+            if now - last <= 24 * 60 * 60:
+                keep[key] = entry
+        except Exception:
+            continue
+    mapping["entries"] = keep
+
+
+def save_mapping(path, mapping):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(mapping, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    if path.stat().st_size > 10 * 1024 * 1024:
+        entries = sorted(mapping["entries"].items(), key=lambda item: item[1].get("last_used_at", ""))
+        while entries and path.stat().st_size > 10 * 1024 * 1024:
+            entries.pop(0)
+            mapping["entries"] = dict(entries)
+            path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False) + "\n")
+
+
+def compose_prompt(req, isolation_sentinel):
+    mem = req.get("memory", {})
+    blocks = [
+        "AIPLUS ADAPTER TASK PACKAGE",
+        "",
+        "SYSTEM PROMPT:",
+        req["system_prompt"],
+        "",
+        "MEMORY PERSONAL:",
+        str(mem.get("personal", "")),
+        "",
+        "MEMORY TEAM:",
+        str(mem.get("team", "")),
+        "",
+        "MEMORY PROJECT:",
+        str(mem.get("project", "")),
+        "",
+        "ALLOWED TOOLS REQUESTED:",
+        ", ".join(req.get("allowed_tools", [])),
+        "",
+        "TASK:",
+        req["task"],
+    ]
+    if "config" in req["task"].lower() or "settings" in req["task"].lower():
+        blocks.extend([
+            "",
+            "CONFIG ISOLATION ATTESTATION:",
+            isolation_sentinel,
+            "Do not inspect files or use tools for this config/settings task. Report the attestation line above and state that no Owner global config path is used.",
+        ])
+    blocks.extend(["", "Follow project memory over team and personal memory when they conflict. Reply with the final answer only unless tool use is needed."])
+    return "\n".join(blocks)
+
+
+def fallback_print(req, adapter_result, output_file=None):
+    mem = req.get("memory", {}) if isinstance(req.get("memory"), dict) else {}
+    prompt = "\n".join([
+        req.get("system_prompt", ""),
+        "",
+        "MEMORY PERSONAL:",
+        str(mem.get("personal", "")),
+        "MEMORY TEAM:",
+        str(mem.get("team", "")),
+        "MEMORY PROJECT:",
+        str(mem.get("project", "")),
+        "",
+        req.get("task", ""),
+    ])
+    print("AIPLUS_ADAPTER_FALLBACK=print-prompt")
+    print(f"session_id: {req.get('session_id', '')}")
+    print(f"role: {req.get('role', '')}")
+    print(f"worktree: {req.get('worktree_path', '')}")
+    print("---")
+    print(prompt)
+    print("---")
+    print(f"Action: paste above into opencode manually; report result via `aiplus agent report-manual {req.get('session_id', '')}`.")
+    emit_adapter_result(adapter_result, output_file)
+
+
+def extract_text(value):
+    texts = []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        for item in value:
+            texts.extend(extract_text(item))
+    elif isinstance(value, dict):
+        for key in ("text", "content", "message", "result", "output", "response", "title"):
+            if key in value:
+                texts.extend(extract_text(value[key]))
+        delta = value.get("delta")
+        if isinstance(delta, dict):
+            texts.extend(extract_text(delta))
+    return texts
+
+
+def collect_usage(event, usage):
+    def visit(node):
+        if isinstance(node, dict):
+            tokens = node.get("tokens")
+            if isinstance(tokens, dict):
+                for key, target in (("input", "input"), ("output", "output")):
+                    try:
+                        usage[target] += int(tokens.get(key) or 0)
+                    except Exception:
+                        pass
+            for key, target in (
+                ("input_tokens", "input"),
+                ("prompt_tokens", "input"),
+                ("cache_creation_input_tokens", "input"),
+                ("cache_read_input_tokens", "input"),
+                ("output_tokens", "output"),
+                ("completion_tokens", "output"),
+            ):
+                if key in node:
+                    try:
+                        usage[target] += int(node.get(key) or 0)
+                    except Exception:
+                        pass
+            for child_node in node.values():
+                visit(child_node)
+        elif isinstance(node, list):
+            for child_node in node:
+                visit(child_node)
+    visit(event)
+
+
+def collect_tool_calls(event, tool_calls):
+    if not isinstance(event, dict):
+        return
+    part = event.get("part")
+    if event.get("type") == "tool_use" and isinstance(part, dict):
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        args = state.get("input") or part.get("input") or {}
+        status = state.get("status")
+        outcome = "err" if status in {"error", "failed"} or state.get("error") else "ok"
+        tool_calls.append({"tool": str(part.get("tool") or "tool"), "args_summary": truncate(json.dumps(args, ensure_ascii=False)), "outcome": outcome})
+        return
+    packed = json.dumps(event, ensure_ascii=False).lower()
+    if not any(marker in packed for marker in ("tool", "command", "bash", "edit", "read")):
+        return
+    name = event.get("tool") or event.get("toolName") or event.get("tool_name") or event.get("name")
+    if not name and event.get("type") in {"tool", "tool_call", "tool_use", "command"}:
+        name = event.get("type")
+    if not name:
+        return
+    args = event.get("args") or event.get("input") or event.get("command") or event.get("parameters") or ""
+    outcome = "err" if event.get("error") or event.get("is_error") else "ok"
+    tool_calls.append({"tool": str(name), "args_summary": truncate(json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else args), "outcome": outcome})
+
+
+def parse_runtime(stdout_lines):
+    final_text = ""
+    usage = {"input": 0, "output": 0}
+    tool_calls = []
+    runtime_session_id = None
+    for line in stdout_lines:
+        try:
+            event = json.loads(line)
+        except Exception:
+            if line.strip():
+                final_text = line.strip()
+            continue
+        if isinstance(event, dict):
+            runtime_session_id = event.get("sessionID") or event.get("sessionId") or event.get("session_id") or event.get("id") or runtime_session_id
+            part = event.get("part")
+            if isinstance(part, dict):
+                runtime_session_id = part.get("sessionID") or runtime_session_id
+            collect_usage(event, usage)
+            collect_tool_calls(event, tool_calls)
+            if event.get("type") == "text" and isinstance(part, dict) and isinstance(part.get("text"), str):
+                final_text = part["text"].strip()
+            elif event.get("type") in {"result", "message"}:
+                texts = [t.strip() for t in extract_text(event) if t and t.strip()]
+                if texts:
+                    final_text = texts[-1]
+    usage_tokens = None
+    total = usage["input"] + usage["output"]
+    if total > 0:
+        usage_tokens = {"input": usage["input"], "output": usage["output"], "total": total}
+    return final_text, (tool_calls or None), usage_tokens, runtime_session_id
+
+
+def send_signal_to_child(sig):
+    global child, child_pgid
+    if child and child.poll() is None:
+        try:
+            if child_pgid:
+                os.killpg(child_pgid, sig)
+            else:
+                child.send_signal(sig)
+        except Exception:
+            pass
+
+
+def signal_handler(signum, frame):
+    global interrupt_at
+    if signum == signal.SIGTERM:
+        interrupt_at = interrupt_at or time.time()
+        send_signal_to_child(signal.SIGTERM)
+        return
+    if interrupt_at and time.time() - interrupt_at <= 3:
+        send_signal_to_child(signal.SIGKILL)
+        return
+    interrupt_at = time.time()
+    send_signal_to_child(signal.SIGINT)
+
+
+def child_env(paths):
+    env = {"PATH": os.environ.get("PATH", ""), "XDG_CONFIG_HOME": str(paths["config_home"])}
+    for key in PROVIDER_ENV_ALLOWLIST:
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    return env
+
+
+def run_opencode(req, paths, isolation_sentinel, mapping_path, mapping):
+    global child, child_pgid, term_sent
+    opencode = shutil.which("opencode")
+    if not opencode:
+        return None, result(req["session_id"], "", None, "RUNTIME_NOT_FOUND", True)
+
+    session_entry = mapping["entries"].get(req["session_id"])
+    resume_id = session_entry.get("runtime_session_id") if session_entry and req.get("continuation_hint") == "continue" else None
+    cmd = [
+        opencode,
+        "run",
+        "--format",
+        "json",
+        "--pure",
+        "--dir",
+        req["worktree_path"],
+        "--title",
+        f"aiplus-{req['role']}-{req['session_id']}",
+    ]
+    model = os.environ.get("AIPLUS_OPENCODE_MODEL")
+    if model:
+        cmd.extend(["--model", model])
+    agent = os.environ.get("AIPLUS_OPENCODE_AGENT")
+    if agent:
+        cmd.extend(["--agent", agent])
+    if resume_id:
+        cmd.extend(["--session", resume_id])
+    if os.environ.get("AIPLUS_OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS") == "1":
+        cmd.append("--dangerously-skip-permissions")
+    cmd.append(compose_prompt(req, isolation_sentinel))
+
+    stdout_lines = []
+    stderr_lines = []
+    child = subprocess.Popen(
+        cmd,
+        cwd=req["worktree_path"],
+        env=child_env(paths),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        preexec_fn=os.setsid,
+    )
+    try:
+        child_pgid = os.getpgid(child.pid)
+    except Exception:
+        child_pgid = None
+
+    deadline = time.time() + max(1, int(req.get("ttl_seconds", 1800)))
+    if child.stdout:
+        os.set_blocking(child.stdout.fileno(), False)
+    if child.stderr:
+        os.set_blocking(child.stderr.fileno(), False)
+    stdout_buffer = ""
+    stderr_buffer = ""
+    while True:
+        read_fds = [fd for fd in (child.stdout, child.stderr) if fd]
+        if read_fds:
+            readable, _, _ = select.select(read_fds, [], [], 0.1)
+            for stream in readable:
+                try:
+                    chunk = stream.read()
+                except Exception:
+                    chunk = ""
+                if not chunk:
+                    continue
+                if stream is child.stdout:
+                    stdout_buffer += chunk
+                    while "\n" in stdout_buffer:
+                        line, stdout_buffer = stdout_buffer.split("\n", 1)
+                        stdout_lines.append(line)
+                        print(line + "\n", end="", flush=True)
+                else:
+                    stderr_buffer += chunk
+                    while "\n" in stderr_buffer:
+                        line, stderr_buffer = stderr_buffer.split("\n", 1)
+                        stderr_lines.append(line)
+        if child.poll() is not None:
+            if stdout_buffer:
+                stdout_lines.append(stdout_buffer.rstrip("\n"))
+                print(stdout_buffer, end="", flush=True)
+            if stderr_buffer:
+                stderr_lines.append(stderr_buffer.rstrip("\n"))
+            break
+        now = time.time()
+        if interrupt_at:
+            if not term_sent and now - interrupt_at >= 5:
+                send_signal_to_child(signal.SIGTERM)
+                term_sent = True
+            if now - interrupt_at >= 10:
+                send_signal_to_child(signal.SIGKILL)
+        if now >= deadline:
+            send_signal_to_child(signal.SIGTERM)
+            time.sleep(1)
+            send_signal_to_child(signal.SIGKILL)
+            break
+        time.sleep(0.05)
+
+    final_text, tool_calls, usage_tokens, runtime_session_id = parse_runtime(stdout_lines)
+    stdout_raw = "\n".join(stdout_lines)
+    if stderr_lines:
+        stdout_raw = stdout_raw + ("\n" if stdout_raw else "") + "\n".join(stderr_lines)
+    if interrupt_at:
+        adapter_result = result(req["session_id"], stdout_raw, final_text, "OWNER_INTERRUPTED", True, tool_calls, usage_tokens)
+    elif child.returncode == 0:
+        adapter_result = result(req["session_id"], stdout_raw, final_text, "OK", False, tool_calls, usage_tokens)
+    else:
+        adapter_result = result(req["session_id"], stdout_raw, final_text, "RUNTIME_FAILURE", True, tool_calls, usage_tokens)
+
+    if adapter_result["exit_status"] == "OK":
+        now_iso = utc_now()
+        runtime_id = runtime_session_id or req["session_id"]
+        prior = mapping["entries"].get(req["session_id"], {})
+        mapping["entries"][req["session_id"]] = {
+            "runtime_session_id": runtime_id,
+            "created_at": prior.get("created_at", now_iso),
+            "last_used_at": now_iso,
+            "role": req["role"],
+        }
+        save_mapping(mapping_path, mapping)
+    return child.returncode, adapter_result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-file")
+    parser.add_argument("--request-file")
+    args = parser.parse_args()
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    req = {}
+    try:
+        req = load_request(args)
+        validate_request(req)
+    except Exception as exc:
+        session_id = req.get("session_id", "") if isinstance(req, dict) else ""
+        adapter_result = result(session_id, "", str(exc), "ADAPTER_REQUEST_INVALID", True)
+        emit_adapter_result(adapter_result, args.output_file)
+        return EX_TEMPFAIL
+
+    append_trace(req["worktree_path"], req["session_id"], "AdapterRequest", req)
+
+    ok, reason = verify_worktree(req)
+    if not ok:
+        adapter_result = result(req["session_id"], "", reason, "WORKSPACE_NOT_PROVISIONED", True)
+        append_trace(req["worktree_path"], req["session_id"], "AdapterResult", adapter_result)
+        emit_adapter_result(adapter_result, args.output_file)
+        return 1
+
+    try:
+        paths, isolation_sentinel = prepare_isolation(req["worktree_path"])
+    except Exception as exc:
+        adapter_result = result(req["session_id"], "", str(exc), "ISOLATION_BREACH", True)
+        append_trace(req["worktree_path"], req["session_id"], "AdapterResult", adapter_result)
+        emit_adapter_result(adapter_result, args.output_file)
+        return 1
+
+    mapping_path, mapping, corrupted = load_mapping(req["worktree_path"])
+    if corrupted:
+        append_trace(req["worktree_path"], req["session_id"], "session_mapping_corruption_recovered", {"path": str(mapping_path)})
+
+    _returncode, adapter_result = run_opencode(req, paths, isolation_sentinel, mapping_path, mapping)
+    append_trace(req["worktree_path"], req["session_id"], "AdapterResult", adapter_result)
+    if adapter_result["exit_status"] == "RUNTIME_NOT_FOUND":
+        fallback_print(req, adapter_result, args.output_file)
+        return EX_TEMPFAIL
+    emit_adapter_result(adapter_result, args.output_file)
+    return 0 if adapter_result["exit_status"] == "OK" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
