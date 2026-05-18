@@ -1,6 +1,6 @@
 # AiPlus Agent Team — Adapter Contract v0
 
-**Status**: v1 DRAFT (informed by Claude Code reference adapter spiral round 1, commit `d04797e` + 2 captured painpoints). Awaits validation by 2nd adapter (OpenCode, round 2) before frozen.
+**Status**: **v1 FROZEN** (validated by Claude Code spiral round 1 at commit `d04797e` and OpenCode spiral round 2 at commit `90500cb`; zero `_CONTRACT-BUG_` painpoints across both rounds — both rounds' painpoints classified as runtime-specific, addressed in adapter IMPLEMENTATION.md or upstream runtime fixes). Future contract changes require explicit Owner-authorized version bump and a new spiral round on at least one adapter.
 **Frozen on**: 2nd adapter pass-through of conformance suite, not earlier.
 **Pilot adapter**: Claude Code (`adapters/claude-code/`).
 **Non-goals**: transport choice, per-arg tool granularity, cross-runtime parallelism, output streaming — out of v0 scope.
@@ -223,6 +223,15 @@ Each runtime's IMPLEMENTATION.md MUST document:
 
 - v0 — initial draft. Spiral round 0.
 - v0.1 — pre-implementation tighten pass: A1+A2 signal-timing aligned with conformance #04; B1-B6 (final_text semantics, tool_calls field requirements, mapping aging hard limits, --output-file flag clarity, §11 schema-version migration, redaction wording); C1 Codex `-C, --cd` confirmed in Appendix A. Still round 0.
-- v1 (this) — after Claude Code reference adapter spiral round 1 (commit `d04797e` + painpoints): added §4.3 runtime-session-ID discovery fallback; restructured §6 into 6.1 auth-channel taxonomy (FORBIDDEN config-dir / ALLOWED env-var / ALLOWED apiKeyHelper) + 6.2 isolation-validation requirement (catches runtimes that silently ignore invalid settings) + 6.3 sentinel attestation (unchanged from v0.1) + 6.4 failure mode (unchanged from v0.1). Recommended provisioning pattern is now backend-agnostic `secret-broker run` (NOT keyring-only `need`). Conformance specs `01-07.spec.md` unchanged — semantics didn't shift.
-- v2 (planned) — after 2nd adapter (OpenCode, round 2) validates contract is not Claude-shaped.
-- **Frozen** = v2 passes full conformance suite on both adapters.
+- v1 — after Claude Code reference adapter spiral round 1 (commit `d04797e` + painpoints): added §4.3 runtime-session-ID discovery fallback; restructured §6 into 6.1 auth-channel taxonomy (FORBIDDEN config-dir / ALLOWED env-var / ALLOWED apiKeyHelper) + 6.2 isolation-validation requirement (catches runtimes that silently ignore invalid settings) + 6.3 sentinel attestation (unchanged from v0.1) + 6.4 failure mode (unchanged from v0.1). Recommended provisioning pattern is now backend-agnostic `secret-broker run` (NOT keyring-only `need`). Conformance specs `01-07.spec.md` unchanged — semantics didn't shift.
+- **v1 FROZEN (this) — 2026-05-18.** Validated via OpenCode spiral round 2 (commit `90500cb`): conformance #01→#02→#03→#06→#04→#05→#07 produced 5 PASS + 2 PASS_WITH_OPENCODE_BUG + 0 FAIL, with both round-2 painpoints classified as `_OPENCODE-BUG_` (upstream OpenCode non-interactive tool-loop instability) — zero `_CONTRACT-BUG_`. Per the Frozen criterion below, the two-adapter validation is complete. No CONTRACT changes required; v1 enters stable phase.
+
+### What Frozen means (and does not mean)
+
+- **Means**: no `_CONTRACT-BUG_` painpoint was found across 2 independent runtime adapters' spiral conformance runs. CONTRACT v1 is the production contract for adapter implementations going forward; future adapters (Codex, future runtimes) SHOULD pass against v1 without contract amendments.
+- **Does NOT mean**: v1 is bug-free, complete, or final-for-all-time. New runtimes with significantly different process models, security models, or output formats may surface gaps requiring v1.x patch or v2. Owner spot-checks of adapter behavior in real workloads remain the higher-authority signal.
+- **To unfreeze**: any future adapter encountering a true `_CONTRACT-BUG_` follows the spiral protocol — STOP, log painpoint, return to Advisor → Owner-authorized version bump → new round.
+
+### Frozen criterion (history)
+
+- **Frozen** = v1 passes full conformance suite on 2 adapters with no `_CONTRACT-BUG_` painpoints. **Met by Claude Code round 1 + OpenCode round 2.**
