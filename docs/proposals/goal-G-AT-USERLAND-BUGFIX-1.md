@@ -8,7 +8,7 @@
 
 ## TL;DR
 
-574 internal cargo tests passed in v0.6.7. ~30 minutes of approximating-real-user testing (install in temp dir, run each new CLI command, MCP tools/call) found **3 real product bugs** that the synthetic test suite missed. This goal fixes them. Time ceiling ≤ 1.5 days.
+574 internal cargo tests passed in v0.6.7. ~30 minutes of approximating-real-user testing (install in temp dir, run each new CLI command, MCP tools/call) found **3 real product bugs** that the synthetic test suite missed. Then Stage 6 setup (isolated `CODEX_HOME` for safe live-agent testing) revealed a **4th bug** + caused an Advisor side-effect on Owner's actual `~/.codex/config.toml` (repaired in place; backup at `~/.codex/config.toml.preuserland-test`). This goal fixes all 4. Time ceiling ≤ 2 days.
 
 ## Bugs
 
@@ -59,6 +59,27 @@
 
 **STOP rule for Bug 3**: if investigation reveals this is structural (API design needs redesign, not wiring), STOP and ping Advisor. Don't reinvent the intent classifier in this goal — fix or surface.
 
+### Bug 4 — `aiplus mcp-register` ignores `CODEX_HOME` env var
+
+**Observed**: with `CODEX_HOME=/tmp/aiplus-userland-test/codex-home` exported, `aiplus mcp-register --runtime codex --force` still writes to `/Users/steve/.codex/config.toml` (Owner's actual global config). The output line `MCP_REGISTER_CODEX=WROTE path=/Users/steve/.codex/config.toml` is the hard-coded path.
+
+**Why it matters**: Two cumulative impacts.
+1. **No way to test mcp-register safely in isolation.** Per codex's own documentation, `CODEX_HOME` is the canonical way to point codex at an alternate config dir. `aiplus mcp-register` should honor it for consistency, otherwise any setup test on a developer machine inevitably touches the real `~/.codex/`.
+2. **Advisor's userland-test side-effected Owner's real codex config.** During Stage 6 setup on 2026-05-19, Advisor exported `CODEX_HOME` expecting isolation, but mcp-register wrote `[mcp_servers.aiplus] command = "/tmp/aiplus-userland-test/bin/aiplus"` into the real config. Advisor manually patched it to point at Owner's actual aiplus binary (`/Users/steve/.cargo/bin/aiplus`) and saved a backup (`~/.codex/config.toml.preuserland-test`). No data loss; one minor mutation Owner is now aware of.
+
+Equivalent paths for the other two runtimes need verification too:
+- Claude Code: respects `CLAUDE_CONFIG_DIR` env per Claude docs — does aiplus mcp-register honor it?
+- OpenCode: where does it look? aiplus mcp-register writes to project-relative `opencode.json` in CWD, not user-global, so probably less of an issue.
+
+**Fix**: in mcp-register's config-path resolution, check `CODEX_HOME` before defaulting to `~/.codex/`. Same pattern for `CLAUDE_CONFIG_DIR` (claude-code). Add a `--config-dir` flag for explicit override. Document the behavior in `--help`.
+
+**Test**: 
+- `CODEX_HOME=/tmp/x aiplus mcp-register --runtime codex --dry-run` says `WOULD_WRITE path=/tmp/x/config.toml`
+- Without env, falls back to `~/.codex/config.toml` (unchanged default)
+- Same isolation check for claude-code
+
+**Severity**: HIGH — silently writes to user's real config when caller intended otherwise. Caused real Advisor incident.
+
 ## Sub-deliverables
 
 | # | Artifact | Status |
@@ -69,6 +90,7 @@
 | 4 | Bug 1 fix in `crates/aiplus-cli/src/main.rs` (mcp_register arg parser) + test | PENDING — CEO |
 | 5 | Bug 2 fix: `--quiet` flag added to Doctor subcommand + doctor.rs threading + test | PENDING — CEO |
 | 6 | Bug 3 root-cause investigation + fix (or STOP if structural) + test | PENDING — CEO |
+| 7 | Bug 4 fix: `mcp-register` honors `CODEX_HOME` / `CLAUDE_CONFIG_DIR` env + `--config-dir` flag + test | PENDING — CEO |
 
 ## Phases
 
@@ -106,6 +128,8 @@ Phase 3 (CEO, ~0.5 day):
 - ✓ `aiplus doctor --quiet` runs, returns 0 INFO lines (only WARN+/FAIL/PASS summary)
 - ✓ `aiplus doctor --help` lists `--quiet` 
 - ✓ `aiplus agent route --score-only "实现支付接口"` produces non-empty `auto_summoned` array containing `security-reviewer` (when OPENAI_API_KEY or ANTHROPIC_API_KEY available) OR produces a visible warning if intent classifier cannot run
+- ✓ `CODEX_HOME=/tmp/x aiplus mcp-register --runtime codex --dry-run` reports `WOULD_WRITE path=/tmp/x/config.toml` (not `~/.codex/config.toml`)
+- ✓ Default behavior unchanged when env not set (writes to `~/.codex/`)
 - ✓ `cargo test --workspace` PASS
 - ✓ `cargo clippy --workspace --all-targets -- -D warnings` clean
 - ✓ Phase 3 evidence includes a re-run of the relevant userland-test steps with each bug demonstrably fixed
